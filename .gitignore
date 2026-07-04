@@ -104,3 +104,5 @@ docs/notebook/*.cpp
 
 .agents/reports
 
+.claude/
+.opencode/

@@ -1499,6 +1499,13 @@ void CodeGenTileLangAscendPto::PipeBarrierCodegen(const CallNode *op) {
   }
   this->PrintIndent();
   this->stream << "pipe_barrier(PIPE_" << pipe << ");\n";
+
+  // Clear dirty flags when a barrier is emitted.
+  // PIPE_ALL synchronizes both scalar and vector pipelines.
+  if (pipe == "ALL") {
+    this->scalar_dirty_ = false;
+    this->vec_dirty_ = false;
+  }
 }
 
 void CodeGenTileLangAscendPto::SetAndWaitFlagCodegen(
@@ -1604,6 +1611,15 @@ void CodeGenTileLangAscendPto::WaitCrossFlagCodegen(const CallNode *op) {
 }
 
 void CodeGenTileLangAscendPto::FillCodegen(const CallNode *op) {
+  // TEXPANDS runs on PIPE_S.
+  // If a vector operation (PIPE_V) was emitted before, we need a barrier
+  // so the scalar pipeline sees the vector result.
+  if (this->vec_dirty_) {
+    this->PrintIndent();
+    this->stream << "pipe_barrier(PIPE_ALL);\n";
+    this->vec_dirty_ = false;
+  }
+
   this->PrintIndent();
   this->stream << "set_flag(PIPE_V, PIPE_S, EVENT_ID0);\n";
   this->PrintIndent();
@@ -1615,6 +1631,7 @@ void CodeGenTileLangAscendPto::FillCodegen(const CallNode *op) {
   this->PrintIndent();
   this->stream << "TEXPANDS" << "(" << dst_name << ", "
                << PrintExpr(op->args[2]) << ");\n";
+  this->scalar_dirty_ = true;
 }
 
 void CodeGenTileLangAscendPto::CreateVecIndexCodegen(
@@ -2194,6 +2211,15 @@ void CodeGenTileLangAscendPto::SetDeqScaleCodegen(const CallNode *op) {
 
 void CodeGenTileLangAscendPto::BinaryVecOpCodegen(const CallNode *op,
                                                   const std::string &op_name) {
+  // Vector operations (TMUL, TADD, TSUB, etc.) run on PIPE_V.
+  // If a scalar operation (PIPE_S) was emitted before, we need a barrier
+  // so the vector pipeline sees the scalar result.
+  if (this->scalar_dirty_) {
+    this->PrintIndent();
+    this->stream << "pipe_barrier(PIPE_ALL);\n";
+    this->scalar_dirty_ = false;
+  }
+
   ShapeInfo src0_shape_info = GetSliceInfo(op->args[1].as<CallNode>());
   ShapeInfo src1_shape_info = GetSliceInfo(op->args[2].as<CallNode>());
   ShapeInfo dst_shape_info = GetSliceInfo(op->args[0].as<CallNode>());
@@ -2208,6 +2234,7 @@ void CodeGenTileLangAscendPto::BinaryVecOpCodegen(const CallNode *op,
   this->PrintIndent();
   this->stream << ns_prefix << op_name << "(" << dst_name << ", " << src0_name
                << ", " << src1_name << ");\n";
+  this->vec_dirty_ = true;
 }
 
 std::string extractBroadCastAxis(const std::string &input) {
@@ -2435,6 +2462,15 @@ bool IsComplexExpression(const PrimExpr &expr) {
 
 void CodeGenTileLangAscendPto::BinaryVecOpsCodegen(const CallNode *op,
                                                    const std::string &op_name) {
+  // Scalar operations (TMULS, TADDS, etc.) run on PIPE_S.
+  // If a vector operation (PIPE_V) was emitted before, we need a barrier
+  // so the scalar pipeline sees the vector result.
+  if (this->vec_dirty_) {
+    this->PrintIndent();
+    this->stream << "pipe_barrier(PIPE_ALL);\n";
+    this->vec_dirty_ = false;
+  }
+
   std::vector<std::string> var_names;
   for (int i = 0; i < (int)op->args.size() - 2; i++) {
     auto var_name = PrintBufferOffset(op->args[i].as<CallNode>());
@@ -2486,6 +2522,7 @@ void CodeGenTileLangAscendPto::BinaryVecOpsCodegen(const CallNode *op,
         this->PrintIndent();
         this->stream << operation << "(" << dst_name << ", " << src_name << ", "
                      << scalar << ");\n";
+        this->scalar_dirty_ = true;
         return;
       }
     }
@@ -2495,6 +2532,7 @@ void CodeGenTileLangAscendPto::BinaryVecOpsCodegen(const CallNode *op,
       this->stream << name << ", ";
     }
     this->stream << scalar << ");\n";
+    this->scalar_dirty_ = true;
     return;
   }
 
@@ -2518,10 +2556,20 @@ void CodeGenTileLangAscendPto::BinaryVecOpsCodegen(const CallNode *op,
   this->PrintIndent();
   this->stream << operation << "(" << dst_name << ", " << src_name << ", "
                << applied_scalar << ");\n";
+  this->scalar_dirty_ = true;
 }
 
 void CodeGenTileLangAscendPto::UnaryVecOpCodegen(const CallNode *op,
                                                  const std::string &op_name) {
+  // Vector operations (TSQRT, etc.) run on PIPE_V.
+  // If a scalar operation (PIPE_S) was emitted before, we need a barrier
+  // so the vector pipeline sees the scalar result.
+  if (this->scalar_dirty_) {
+    this->PrintIndent();
+    this->stream << "pipe_barrier(PIPE_ALL);\n";
+    this->scalar_dirty_ = false;
+  }
+
   ShapeInfo src_shape_info = GetSliceInfo(op->args[1].as<CallNode>());
   ShapeInfo dst_shape_info = GetSliceInfo(op->args[0].as<CallNode>());
 
@@ -2530,6 +2578,7 @@ void CodeGenTileLangAscendPto::UnaryVecOpCodegen(const CallNode *op,
 
   this->PrintIndent();
   this->stream << op_name << "(" << dst_name << ", " << src_name << ");\n";
+  this->vec_dirty_ = true;
 }
 
 void CodeGenTileLangAscendPto::ScalarOpCodegen(const CallNode *op,
@@ -3026,6 +3075,19 @@ void CodeGenTileLangAscendPto::VisitStmt_(const AttrStmtNode *op) {
       stream << "  set_mask_norm();\n";
       this->PrintIndent();
       stream << "  set_vector_mask(-1, -1);\n";
+
+      // Emit zero-fills for small UB buffers (valid_N < padded N).
+      // These TEXPANDS run on PIPE_S and initialize padding elements to 0,
+      // preventing garbage data from corrupt tile arithmetic later.
+      for (const auto &[buf_name, zero_val] : pending_zero_fills_) {
+        this->PrintIndent();
+        stream << "  set_flag(PIPE_V, PIPE_S, EVENT_ID0);\n";
+        this->PrintIndent();
+        stream << "  wait_flag(PIPE_V, PIPE_S, EVENT_ID0);\n";
+        this->PrintIndent();
+        stream << "  TEXPANDS(" << buf_name << ", " << zero_val << ");\n";
+      }
+      pending_zero_fills_.clear();
     }
 
     std::string old_scope = this->current_resource_scope_;
@@ -3145,6 +3207,23 @@ void CodeGenTileLangAscendPto::VisitStmt_(const AllocateNode *op) {
   // Print the address assignment (TASSIGN)
   this->PrintIndent();
   stream << "TASSIGN(" << vid << ", " << PrintExpr(target_address) << ");\n";
+
+  // For UB buffers where the valid column count is smaller than the physical
+  // (padded) column count, record them for zero-fill at kernel entry.
+  // PTO vector instructions always operate on the full physical tile width;
+  // without this fill, padding slots contain whatever was left in UB memory
+  // and silently corrupt arithmetic that involves the tile.
+  if (scope == "shared") {
+    const auto *valid_n_imm = valid_N.as<IntImmNode>();
+    const auto *n_imm = N.as<IntImmNode>();
+    if (valid_n_imm && n_imm && valid_n_imm->value < n_imm->value) {
+      std::string zero_literal = "0";
+      if (type == "float") zero_literal = "0.000000e+00f";
+      else if (type == "half") zero_literal = "half(0)";
+      else if (type == "bfloat16_t") zero_literal = "bfloat16_t(0)";
+      pending_zero_fills_.emplace_back(vid, zero_literal);
+    }
+  }
 
   this->PrintStmt(op->body);
 }
@@ -3429,6 +3508,13 @@ void CodeGenTileLangAscendPto::AutoBarrierCodegen(const CallNode *op) {
     }
   }
   this->stream << "pipe_barrier(" << pipeline << ");\n";
+
+  // Clear dirty flags when a barrier is emitted.
+  // PIPE_ALL synchronizes both scalar and vector pipelines.
+  if (pipeline == "PIPE_ALL") {
+    this->scalar_dirty_ = false;
+    this->vec_dirty_ = false;
+  }
 }
 
 void CodeGenTileLangAscendPto::AutoFlagOpCodegen(const CallNode *op,

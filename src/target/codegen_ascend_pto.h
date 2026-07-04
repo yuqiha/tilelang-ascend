@@ -336,6 +336,17 @@ private:
 
   std::string current_resource_scope_ =
       ""; // Identifies whether it's CUBE or VEC
+
+  // Small UB buffers that need zero-fill at kernel entry (valid_N < padded N)
+  std::vector<std::pair<std::string, std::string>> pending_zero_fills_;
+
+  // Track whether scalar (PIPE_S) or vector (PIPE_V) operations have been
+  // emitted without a synchronizing barrier.  When a scalar op is followed
+  // by a vector op (or vice-versa) that touches the same UB address, a
+  // pipe_barrier(PIPE_ALL) is required so the second pipeline sees the
+  // result written by the first.
+  bool scalar_dirty_{false};
+  bool vec_dirty_{false};
 };
 
 } // namespace codegen

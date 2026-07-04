@@ -14,7 +14,6 @@ Two kernels, selected at host level:
 import tilelang
 from tilelang import language as T
 import torch
-tilelang.cache.clear_cache()
 
 pass_configs = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
@@ -25,7 +24,7 @@ CAST_LOW2HIGH = "CAST_NONE"
 CAST_HIGH2LOW = "CAST_RINT"
 
 
-@tilelang.jit(out_idx=[3], pass_configs=pass_configs, target="pto")
+@tilelang.jit(out_idx=[3], pass_configs=pass_configs)
 def group_norm_kernel_serial(N, G, cpg_padded, S_padded, block_S, s_num, eps=1e-5, cpg=0, S_orig=0, dtype="float32"):
     """Original serial kernel: T.serial + double-buffer + MTE2/V/MTE3 3-stage."""
     block_num = N * G

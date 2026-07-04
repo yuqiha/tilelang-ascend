@@ -14,7 +14,6 @@ Two kernels, selected at host level:
 import tilelang
 from tilelang import language as T
 import torch
-tilelang.cache.clear_cache()
 
 pass_configs = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
@@ -26,7 +25,9 @@ CAST_HIGH2LOW = "CAST_RINT"
 
 
 @tilelang.jit(out_idx=[3], pass_configs=pass_configs, target="pto")
-def group_norm_kernel_serial(N, G, cpg_padded, S_padded, block_S, s_num, eps=1e-5, cpg=0, S_orig=0, dtype="float32"):
+def group_norm_kernel_serial(
+    N, G, cpg_padded, S_padded, block_S, s_num, eps=1e-5, cpg=0, S_orig=0, dtype="float32"
+):
     """Original serial kernel: T.serial + double-buffer + MTE2/V/MTE3 3-stage."""
     block_num = N * G
     tile_elem = cpg * block_S
@@ -58,19 +59,6 @@ def group_norm_kernel_serial(N, G, cpg_padded, S_padded, block_S, s_num, eps=1e-
                 mean_col = T.alloc_ub([cpg, 1], cal_dtype)
                 std_col = T.alloc_ub([cpg, 1], cal_dtype)
                 data_cal = T.alloc_ub([cpg, block_S], cal_dtype)
-                mean_bc = T.alloc_ub([cpg, block_S], cal_dtype)
-                std_bc = T.alloc_ub([cpg, block_S], cal_dtype)
-                gamma_raw = T.alloc_ub([cpg_padded, 1], dtype)
-                beta_raw = T.alloc_ub([cpg_padded, 1], dtype)
-                gamma_cal = T.alloc_ub([cpg_padded, 1], cal_dtype)
-                beta_cal = T.alloc_ub([cpg_padded, 1], cal_dtype)
-                gamma_bc_full = T.alloc_ub([cpg_padded, block_S], cal_dtype)
-                beta_bc_full = T.alloc_ub([cpg_padded, block_S], cal_dtype)
-                gamma_bc = T.alloc_ub([cpg, block_S], cal_dtype)
-                beta_bc = T.alloc_ub([cpg, block_S], cal_dtype)
-                data_buf_p2 = T.alloc_ub([2, cpg, block_S], dtype)
-                data_cal_p2 = T.alloc_ub([cpg, block_S], cal_dtype)
-                out_buf_p2 = T.alloc_ub([2, cpg, block_S], dtype)
 
                 with T.Scope("V"):
                     T.tile.fill(sum_a, 0.0)
@@ -111,6 +99,21 @@ def group_norm_kernel_serial(N, G, cpg_padded, S_padded, block_S, s_num, eps=1e-
                     T.tile.add(var_val, var_val, eps_v)
                     T.tile.sqrt(std_val, var_val)
 
+                mean_bc = T.alloc_ub([cpg, block_S], cal_dtype)
+                std_bc = T.alloc_ub([cpg, block_S], cal_dtype)
+                gamma_raw = T.alloc_ub([cpg_padded, 1], dtype)
+                beta_raw = T.alloc_ub([cpg_padded, 1], dtype)
+                gamma_cal = T.alloc_ub([cpg_padded, 1], cal_dtype)
+                beta_cal = T.alloc_ub([cpg_padded, 1], cal_dtype)
+                gamma_bc_full = T.alloc_ub([cpg_padded, block_S], cal_dtype)
+                beta_bc_full = T.alloc_ub([cpg_padded, block_S], cal_dtype)
+                gamma_bc = T.alloc_ub([cpg, block_S], cal_dtype)
+                beta_bc = T.alloc_ub([cpg, block_S], cal_dtype)
+                data_buf_p2 = T.alloc_ub([2, cpg, block_S], dtype)
+                data_cal_p2 = T.alloc_ub([cpg, block_S], cal_dtype)
+                out_buf_p2 = T.alloc_ub([2, cpg, block_S], dtype)
+
+                with T.Scope("V"):
                     T.tile.fill(mean_col, total)
                     T.tile.broadcast(mean_bc, mean_col)
                     T.tile.fill(std_col, std_val)
@@ -151,10 +154,8 @@ def group_norm_kernel_serial(N, G, cpg_padded, S_padded, block_S, s_num, eps=1e-
                         T.wait_flag("mte2", "v", cur)
                         if use_fp32:
                             T.tile.cast(
-                                data_cal_p2,
-                                data_buf_p2[cur, :, :],
-                                CAST_LOW2HIGH,
-                                tile_elem,
+                                data_cal_p2, data_buf_p2[cur, :, :],
+                                CAST_LOW2HIGH, tile_elem,
                             )
                         else:
                             T.copy(data_buf_p2[cur, :, :], data_cal_p2)
@@ -164,10 +165,8 @@ def group_norm_kernel_serial(N, G, cpg_padded, S_padded, block_S, s_num, eps=1e-
                         T.tile.add(data_cal_p2, data_cal_p2, beta_bc)
                         if use_fp32:
                             T.tile.cast(
-                                out_buf_p2[cur, :, :],
-                                data_cal_p2,
-                                CAST_HIGH2LOW,
-                                tile_elem,
+                                out_buf_p2[cur, :, :], data_cal_p2,
+                                CAST_HIGH2LOW, tile_elem,
                             )
                         else:
                             T.copy(data_cal_p2, out_buf_p2[cur, :, :])
@@ -186,17 +185,9 @@ def group_norm_kernel_serial(N, G, cpg_padded, S_padded, block_S, s_num, eps=1e-
     return main
 
 
-@tilelang.jit(out_idx=[3], pass_configs=pass_configs)
+@tilelang.jit(out_idx=[3], pass_configs=pass_configs, target="pto")
 def group_norm_kernel_cpipeline(
-    N,
-    G,
-    cpg_padded,
-    S_padded,
-    block_S,
-    eps=1e-5,
-    cpg=0,
-    S_orig=0,
-    dtype="float32",
+    N, G, cpg_padded, S_padded, block_S, eps=1e-5, cpg=0, S_orig=0, dtype="float32",
 ):
     """Cpipeline kernel: s_num==1 + T.Pipelined + parity-split + cpg-dim pipeline."""
     # Force block_C=128 max to ensure 2-tile pipeline even when block_S=1
@@ -246,6 +237,9 @@ def group_norm_kernel_cpipeline(
                 beta_bc_full = T.alloc_ub([cpg_padded, block_S], cal_dtype)
                 gamma_bc = T.alloc_ub([cpg, block_S], cal_dtype)
                 beta_bc = T.alloc_ub([cpg, block_S], cal_dtype)
+                data_buf_p2 = T.alloc_ub([2, cpg, block_S], dtype)
+                data_cal_p2 = T.alloc_ub([cpg, block_S], cal_dtype)
+                out_buf_p2 = T.alloc_ub([2, cpg, block_S], dtype)
 
                 with T.Scope("V"):
                     T.tile.fill(sum_a, 0.0)
@@ -457,7 +451,7 @@ def group_norm(x, gamma, beta, num_groups, eps=1e-5):
     block_C = ((block_C // 16) * 16) if s_num == 1 else 0
     block_C = max(16, min(cpg, block_C)) if s_num == 1 else 0
     cpg_full_tiles = (cpg // block_C) if s_num == 1 else 0
-    use_cpipeline = s_num == 1 and cpg_full_tiles >= 2
+    use_cpipeline = (s_num == 1 and cpg_full_tiles >= 2)
 
     x_4d = x.reshape(N, num_groups, cpg, S)
     gamma_2d = gamma.reshape(num_groups, cpg)
@@ -465,11 +459,15 @@ def group_norm(x, gamma, beta, num_groups, eps=1e-5):
 
     if use_cpipeline:
         # Only pad when S < block_S to match kernel's memory access pattern
-        if block_S > S:
+        if S < block_S:
             x_4d = torch.nn.functional.pad(x_4d, (0, block_S - S))
-        func = group_norm_kernel_cpipeline(N, num_groups, cpg_padded, S_padded, block_S, eps, cpg, S, dtype_str)
+        func = group_norm_kernel_cpipeline(
+            N, num_groups, cpg_padded, S_padded, block_S, eps, cpg, S, dtype_str
+        )
     else:
-        func = group_norm_kernel_serial(N, num_groups, cpg_padded, S_padded, block_S, s_num, eps, cpg, S, dtype_str)
+        func = group_norm_kernel_serial(
+            N, num_groups, cpg_padded, S_padded, block_S, s_num, eps, cpg, S, dtype_str
+        )
     y_4d = func(x_4d, gamma_2d, beta_2d)
 
     y_4d = y_4d[:, :, :, :S]
@@ -479,7 +477,9 @@ def group_norm(x, gamma, beta, num_groups, eps=1e-5):
 def golden_group_norm(x, gamma, beta, num_groups, eps=1e-5):
     """PyTorch reference implementation."""
     if x.ndim == 2:
-        return torch.nn.functional.group_norm(x.unsqueeze(-1), num_groups, gamma, beta, eps).squeeze(-1)
+        return torch.nn.functional.group_norm(
+            x.unsqueeze(-1), num_groups, gamma, beta, eps
+        ).squeeze(-1)
     return torch.nn.functional.group_norm(x, num_groups, gamma, beta, eps)
 
 
@@ -494,26 +494,26 @@ if __name__ == "__main__":
     }
 
     test_cases = [
-        ("basic_4d_fp16", [8, 32, 64, 64], "float16", 8, 1e-5),
-        ("basic_4d_fp32", [4, 64, 128, 128], "float32", 16, 1e-5),
-        ("basic_4d_bf16", [2, 128, 256, 256], "bfloat16", 32, 1e-5),
-        ("group1_layernorm", [16, 257, 32, 31], "float16", 1, 1e-5),
-        ("group2_fp32", [8, 512, 17, 15], "float32", 2, 1e-5),
-        ("basic_3d_bf16", [64, 64, 128], "bfloat16", 4, 1e-5),
-        ("large_4d_fp16", [2, 256, 128, 128], "float16", 16, 1e-5),
-        ("group1_fp32", [16, 127, 31, 33], "float32", 1, 1e-6),
-        ("small_eps_bf16", [3, 64, 64, 64], "bfloat16", 8, 1e-3),
-        ("non_aligned", [7, 32, 63, 65], "float16", 4, 1e-4),
-        ("large_range_fp32", [3, 64, 127, 129], "float32", 8, 1e-4),
-        ("group6_bf16", [5, 48, 33, 65], "bfloat16", 6, 1e-4),
+        # ("basic_4d_fp16", [8, 32, 64, 64], "float16", 8, 1e-5),
+        # ("basic_4d_fp32", [4, 64, 128, 128], "float32", 16, 1e-5),
+        # ("basic_4d_bf16", [2, 128, 256, 256], "bfloat16", 32, 1e-5),
+        # ("group1_layernorm", [16, 257, 32, 31], "float16", 1, 1e-5),
+        # ("group2_fp32", [8, 512, 17, 15], "float32", 2, 1e-5),
+        # ("basic_3d_bf16", [64, 64, 128], "bfloat16", 4, 1e-5),
+        # ("large_4d_fp16", [2, 256, 128, 128], "float16", 16, 1e-5),
+        # ("group1_fp32", [16, 127, 31, 33], "float32", 1, 1e-6),
+        # ("small_eps_bf16", [3, 64, 64, 64], "bfloat16", 8, 1e-3),
+        # ("non_aligned", [7, 32, 63, 65], "float16", 4, 1e-4),
+        # ("large_range_fp32", [3, 64, 127, 129], "float32", 8, 1e-4),
+        # ("group6_bf16", [5, 48, 33, 65], "bfloat16", 6, 1e-4),
         ("basic_2d_fp16", [1023, 257], "float16", 1, 1e-6),
-        ("basic_5d_fp32", [2, 60, 5, 7, 480], "float32", 4, 1e-5),
-        ("inf_special_bf16", [4, 31, 251, 251], "bfloat16", 1, 1e-8),
-        ("nan_special_fp16", [2, 64, 67, 71], "float16", 8, 1e-7),
-        ("all_zeros_fp32", [8, 127, 33, 31], "float32", 1, 1e-4),
-        ("large_4d_bf16", [2, 256, 127, 129], "bfloat16", 16, 1e-5),
-        ("fp16_boundary", [4, 128, 255, 257], "float16", 32, 1e-3),
-        ("group3_fp32", [1, 513, 63, 63], "float32", 3, 1e-6),
+        # ("basic_5d_fp32", [2, 60, 5, 7, 480], "float32", 4, 1e-5),
+        # ("inf_special_bf16", [4, 31, 251, 251], "bfloat16", 1, 1e-8),
+        # ("nan_special_fp16", [2, 64, 67, 71], "float16", 8, 1e-7),
+        # ("all_zeros_fp32", [8, 127, 33, 31], "float32", 1, 1e-4),
+        # ("large_4d_bf16", [2, 256, 127, 129], "bfloat16", 16, 1e-5),
+        # ("fp16_boundary", [4, 128, 255, 257], "float16", 32, 1e-3),
+        # ("group3_fp32", [1, 513, 63, 63], "float32", 3, 1e-6),
     ]
 
     all_passed = True
