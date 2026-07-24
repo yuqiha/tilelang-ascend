@@ -53,6 +53,7 @@ private:
   // shorter mma addresses the wrong K-blocks. Applies to matrix_b only, since
   // matrix_a is [M, K] and has no N.
   PrimExpr realN;
+  PrimExpr user_strideN;
 };
 
 class AscendAtomicAdd : public Operator {

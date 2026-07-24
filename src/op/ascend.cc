@@ -85,6 +85,10 @@ AscendCopy::AscendCopy(Array<PrimExpr> args, BufferMap vmap) : args_(args) {
   if (args.size() >= 9) {
     realN = args[8];
   }
+  user_strideN = Integer(-1);
+  if (args.size() >= 10) {
+    user_strideN = args[9];
+  }
   std::tie(this->src, this->dst) = std::tie(bf[0], bf[1]);
   std::tie(this->src_range, this->dst_range) = std::tie(rgs[0], rgs[1]);
   std::tie(this->src_extents, this->dst_extents) = std::tie(ets[0], ets[1]);
@@ -230,58 +234,76 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
     if (src.scope() == "global") {
       config.gm2ub = true;
-      strideN = compute_strideN(src, src_extents);
+      auto *user_sn = user_strideN.as<IntImmNode>();
+      bool has_user_stride = !(user_sn && user_sn->value == -1);
+      if (has_user_stride) {
+        strideN = user_strideN;
+      } else {
+        strideN = compute_strideN(src, src_extents);
+      }
       config.needs_strideN = true;
 
       ss << "copy_gm_to_ub<";
       ss << get_dtype(src) << ", ";
-      // The column dim is a COMPILE-TIME template arg. A runtime inner-extent
-      // slice (dynamic width, e.g. a softmax's actual window tw_a < buffer
-      // width) would put a non-const expr in the template -> invalid C++ ("use
-      // of undeclared identifier"). Use the buffer's compile-time shape for the
-      // template; the runtime width is already carried by the maskShapeN
-      // function arg (validCol_dst). A const extent stays byte-identical (==
-      // shape for a full copy, or the const slice width), so every existing
-      // caller is unchanged -- only the previously-uncompilable runtime-slice
-      // case changes.
-      PrimExpr gm2ub_tmpl_n = dst_extents[dst->shape.size() - 1];
-      if (!gm2ub_tmpl_n->IsInstance<IntImmNode>()) {
+      PrimExpr gm2ub_tmpl_n;
+      if (has_user_stride) {
         gm2ub_tmpl_n = dst->shape[dst->shape.size() - 1];
-        // The shape fallback must itself be a compile-time constant; a buffer
-        // declared with a dynamic inner dim would still emit a non-const
-        // template arg (the invalid-C++ case above), so fail early and clearly.
-        ICHECK(gm2ub_tmpl_n->IsInstance<IntImmNode>())
-            << "copy_gm_to_ub: the inner (column) dimension of the destination "
-               "buffer shape must be a compile-time constant, but got "
-            << gm2ub_tmpl_n;
+      } else {
+        gm2ub_tmpl_n = dst_extents[dst->shape.size() - 1];
+        if (!gm2ub_tmpl_n->IsInstance<IntImmNode>()) {
+          gm2ub_tmpl_n = dst->shape[dst->shape.size() - 1];
+        }
       }
+      ICHECK(gm2ub_tmpl_n->IsInstance<IntImmNode>())
+          << "copy_gm_to_ub: the inner (column) dimension of the destination "
+             "buffer shape must be a compile-time constant, but got "
+          << gm2ub_tmpl_n;
       ss << gm2ub_tmpl_n;
       if (dst->shape.size() > 1) {
-        ss << ", " << compute_blocklen(dst, dst_extents);
+        PrimExpr gm2ub_tmpl_m;
+        if (has_user_stride) {
+          gm2ub_tmpl_m = dst->shape[dst->shape.size() - 2];
+        } else {
+          gm2ub_tmpl_m = compute_blocklen(dst, dst_extents);
+        }
+        ss << ", " << gm2ub_tmpl_m;
       }
       ss << ">";
     } else if (dst.scope() == "global") {
       config.ub2gm = true;
-      strideN = compute_strideN(dst, dst_extents);
+      auto *user_sn = user_strideN.as<IntImmNode>();
+      bool has_user_stride = !(user_sn && user_sn->value == -1);
+      if (has_user_stride) {
+        strideN = user_strideN;
+      } else {
+        strideN = compute_strideN(dst, dst_extents);
+      }
       config.needs_strideN = true;
 
       ss << "copy_ub_to_gm<";
       ss << get_dtype(dst) << ", ";
-      // See copy_gm_to_ub above: a runtime inner-extent must use the buffer's
-      // compile-time shape for the template col dim (runtime width is carried
-      // by the maskShapeN function arg); const extents are byte-identical.
-      PrimExpr ub2gm_tmpl_n = src_extents[src->shape.size() - 1];
-      if (!ub2gm_tmpl_n->IsInstance<IntImmNode>()) {
-        ub2gm_tmpl_n = src->shape[src->shape.size() - 1];
-        // See copy_gm_to_ub: the shape fallback must itself be compile-time.
-        ICHECK(ub2gm_tmpl_n->IsInstance<IntImmNode>())
-            << "copy_ub_to_gm: the inner (column) dimension of the source "
-               "buffer shape must be a compile-time constant, but got "
-            << ub2gm_tmpl_n;
+      PrimExpr ub2gam_tmpl_n;
+      if (has_user_stride) {
+        ub2gam_tmpl_n = src->shape[src->shape.size() - 1];
+      } else {
+        ub2gam_tmpl_n = src_extents[src->shape.size() - 1];
+        if (!ub2gam_tmpl_n->IsInstance<IntImmNode>()) {
+          ub2gam_tmpl_n = src->shape[src->shape.size() - 1];
+        }
       }
-      ss << ub2gm_tmpl_n;
+      ICHECK(ub2gam_tmpl_n->IsInstance<IntImmNode>())
+          << "copy_ub_to_gm: the inner (column) dimension of the source "
+             "buffer shape must be a compile-time constant, but got "
+          << ub2gam_tmpl_n;
+      ss << ub2gam_tmpl_n;
       if (src->shape.size() > 1) {
-        ss << ", " << compute_blocklen(src, src_extents);
+        PrimExpr ub2gam_tmpl_m;
+        if (has_user_stride) {
+          ub2gam_tmpl_m = src->shape[src->shape.size() - 2];
+        } else {
+          ub2gam_tmpl_m = compute_blocklen(src, src_extents);
+        }
+        ss << ", " << ub2gam_tmpl_m;
       }
       ss << ">";
     } else if (dst.scope() == "shared.l1") {
@@ -551,8 +573,12 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 
   if (config.gm2ub) {
-    new_args.push_back(validRow_src);
-    new_args.push_back(validCol_src);
+    auto *user_sn = user_strideN.as<IntImmNode>();
+    bool has_user_stride = !(user_sn && user_sn->value == -1);
+    PrimExpr row_count = has_user_stride ? validRow_dst : validRow_src;
+    PrimExpr col_count = has_user_stride ? validCol_dst : validCol_src;
+    new_args.push_back(row_count);
+    new_args.push_back(col_count);
     PrimExpr pad_val = padValue;
     if (pad_val->dtype != dst->dtype) {
       pad_val = Cast(dst->dtype, pad_val);
@@ -568,8 +594,12 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 
   if (config.ub2gm) {
-    new_args.push_back(validRow_dst);
-    new_args.push_back(validCol_dst);
+    auto *user_sn = user_strideN.as<IntImmNode>();
+    bool has_user_stride = !(user_sn && user_sn->value == -1);
+    PrimExpr row_count = has_user_stride ? validRow_src : validRow_dst;
+    PrimExpr col_count = has_user_stride ? validCol_src : validCol_dst;
+    new_args.push_back(row_count);
+    new_args.push_back(col_count);
     if (src->shape.size() > 1) {
       new_args.push_back(src->shape[src->shape.size() - 2]);
     }

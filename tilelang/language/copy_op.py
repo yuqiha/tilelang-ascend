@@ -264,6 +264,7 @@ def npu_copy_v2(
     unit_flag: int | None = None,
     real_k: int | tir.PrimExpr | None = None,
     real_n: int | tir.PrimExpr | None = None,
+    stride: int | tir.PrimExpr | None = None,
 ):
     """Copy data between memory regions.
 
@@ -300,6 +301,10 @@ def npu_copy_v2(
             stride from the column count, so a full-width load followed by a
             shorter ``T.mma(n_actual=...)`` addresses the wrong K-blocks. Applies
             to matrix_b only, since matrix_a is ``[M, K]`` and has no N.
+        stride (int | tir.PrimExpr | None): GM-side row width (in elements) for
+            strided DMA. When set, overrides the auto-derived strideN from buffer
+            shape, enabling nburst>1 copies from 1D flat tensors. Defaults to None
+            (auto-derive from buffer shape via compute_strideN).
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
@@ -390,12 +395,17 @@ def npu_copy_v2(
     def _as_expr(value):
         return value if isinstance(value, tir.PrimExpr) else tir.IntImm("int32", int(value))
 
-    if unit_flag is not None or real_k is not None or real_n is not None:
+    has_cube_args = unit_flag is not None or real_k is not None or real_n is not None
+    has_stride = stride is not None
+
+    if has_cube_args or has_stride:
         copy_args.append(tir.IntImm("int32", int(unit_flag) if unit_flag is not None else 0))
-        if real_k is not None or real_n is not None:
+        if real_k is not None or real_n is not None or has_stride:
             copy_args.append(_as_expr(real_k) if real_k is not None else tir.IntImm("int32", 0))
-            if real_n is not None:
-                copy_args.append(_as_expr(real_n))
+            if real_n is not None or has_stride:
+                copy_args.append(_as_expr(real_n) if real_n is not None else tir.IntImm("int32", 0))
+                if has_stride:
+                    copy_args.append(_as_expr(stride))
 
     return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_copy"), *copy_args)
 
